@@ -256,6 +256,7 @@ func (c *Client) ListUsers(ctx context.Context, offset, count int) (*UsersListRe
 	query := url.Values{}
 	query.Set("offset", strconv.Itoa(offset))
 	query.Set("count", strconv.Itoa(count))
+	query.Set("fields", `{"username":1,"name":1,"status":1,"statusText":1,"type":1,"active":1,"roles":1,"utcOffset":1}`)
 
 	var resp UsersListResponse
 
@@ -265,6 +266,37 @@ func (c *Client) ListUsers(ctx context.Context, offset, count int) (*UsersListRe
 	}
 
 	return &resp, nil
+}
+
+// CreateDM creates or opens a direct message room with username and updates the room cache.
+func (c *Client) CreateDM(ctx context.Context, username string) (*Room, error) {
+	if username == "" {
+		return nil, errors.New("rocketchatclient: username is required")
+	}
+
+	req := struct {
+		Username string `json:"username"`
+	}{
+		Username: username,
+	}
+
+	var resp struct {
+		Room    *Room `json:"room"`
+		Success bool  `json:"success"`
+	}
+
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/im.create", nil, req, &resp, true)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Room == nil || resp.Room.ID == "" {
+		return nil, errors.New("rocketchatclient: im.create response missing room")
+	}
+
+	c.cache.upsertRoom(resp.Room)
+
+	return cloneRoom(resp.Room), nil
 }
 
 // GetUserInfo fetches a single user by userID or username and updates the cache.

@@ -27,6 +27,8 @@ const (
 	maxReconnectBackoff = time.Minute
 	eventQueueSize      = 2048
 	maxInitialRoomSubs  = 100
+	maxInitialUserPages = 5
+	userHydrateTimeout  = 10 * time.Second
 	parentFetchTimeout  = 3 * time.Second
 
 	ddpFieldMsg        = "msg"
@@ -761,30 +763,58 @@ func (c *Client) hydrateState(ctx context.Context) error {
 	}
 
 	c.cache.hydrateRoomsAndSubs(roomsResp.Update, subsResp.Update)
+	c.seedUsersFromRooms(roomsResp.Update)
 
-	for offset := 0; ; {
-		usersResp, err := c.ListUsers(ctx, offset, userListPageLimit)
+	userCtx, cancel := context.WithTimeout(ctx, userHydrateTimeout)
+	defer cancel()
+
+	loaded := 0
+
+	for page := range maxInitialUserPages {
+		usersResp, err := c.ListUsers(userCtx, loaded, userListPageLimit)
 		if err != nil {
-			var apiErr *APIError
-			if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusForbidden || apiErr.StatusCode == http.StatusUnauthorized) {
-				c.logger.Warnf("users.list restricted (%s); continuing with lazy user lookups", apiErr)
+			c.logger.Warnf("users.list stopped after %d user(s) (%s); continuing with lazy user lookups", loaded, err)
 
-				break
-			}
-
-			return fmt.Errorf("rocketchatclient: users.list: %w", err)
-		}
-
-		c.cache.upsertUsers(usersResp.Users)
-
-		if len(usersResp.Users) == 0 || offset+len(usersResp.Users) >= usersResp.Total {
 			break
 		}
 
-		offset += len(usersResp.Users)
+		c.cache.upsertUsers(usersResp.Users)
+		loaded += len(usersResp.Users)
+
+		if len(usersResp.Users) == 0 || loaded >= usersResp.Total {
+			break
+		}
+
+		if page+1 == maxInitialUserPages && loaded < usersResp.Total {
+			c.logger.Infof("users.list capped at %d/%d users during startup; remaining users will resolve lazily", loaded, usersResp.Total)
+		}
 	}
 
 	return nil
+}
+
+func (c *Client) seedUsersFromRooms(rooms []Room) {
+	for i := range rooms {
+		r := &rooms[i]
+		if len(r.UIDs) == 0 || len(r.UIDs) != len(r.Usernames) {
+			continue
+		}
+
+		for idx, uid := range r.UIDs {
+			uname := r.Usernames[idx]
+			if uid == "" || uname == "" {
+				continue
+			}
+
+			if _, ok := c.cache.user(uid); !ok {
+				c.cache.upsertUser(&User{
+					ID:       uid,
+					Username: uname,
+					Active:   true,
+				})
+			}
+		}
+	}
 }
 
 func (c *Client) eventLoop(ctx context.Context) {
