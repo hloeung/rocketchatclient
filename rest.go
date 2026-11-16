@@ -3,6 +3,7 @@ package rocketchatclient
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,8 @@ const (
 	defaultRateWait   = 3 * time.Second
 	maxRateLimitWait  = 60 * time.Second
 	userListPageLimit = 100
+	meteorIDLen       = 17
+	base62Alphabet    = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
 
 // APIError represents an error payload returned by the Rocket.Chat REST API.
@@ -303,6 +306,213 @@ func (c *Client) DownloadURL(fileID, fileName string) string {
 	}
 
 	return c.httpURL + "/file-upload/" + url.PathEscape(fileID) + "/" + url.PathEscape(fileName)
+}
+
+func generateMeteorID() string {
+	const maxValidByte = 248 // 62 * 4, avoids modulo bias
+
+	var (
+		out [meteorIDLen]byte
+		buf [32]byte
+	)
+
+	idx := 0
+
+	for idx < meteorIDLen {
+		_, err := rand.Read(buf[:])
+		if err != nil {
+			// Fallback to timestamp-derived entropy only if crypto/rand fails.
+			now := uint64(time.Now().UnixNano())
+			for idx < meteorIDLen {
+				out[idx] = base62Alphabet[now%62]
+				now /= 62
+				idx++
+			}
+
+			break
+		}
+
+		for _, b := range buf {
+			if b >= maxValidByte {
+				continue
+			}
+
+			out[idx] = base62Alphabet[b%62]
+			idx++
+
+			if idx == meteorIDLen {
+				break
+			}
+		}
+	}
+
+	return string(out[:])
+}
+
+// SendMessage sends a message (or thread reply when threadID is non-empty) to roomID.
+func (c *Client) SendMessage(ctx context.Context, roomID, text, threadID string) (string, error) {
+	if roomID == "" {
+		return "", errors.New("rocketchatclient: roomID is required")
+	}
+
+	msgID := generateMeteorID()
+	sentKey := "send:" + msgID
+
+	c.cache.markSent(sentKey)
+
+	req := struct {
+		Message struct {
+			ID       string `json:"_id"`
+			RoomID   string `json:"rid"`
+			Text     string `json:"msg"`
+			ThreadID string `json:"tmid,omitempty"`
+		} `json:"message"`
+	}{}
+	req.Message.ID = msgID
+	req.Message.RoomID = roomID
+	req.Message.Text = text
+	req.Message.ThreadID = threadID
+
+	var resp struct {
+		Message *Message `json:"message"`
+		Success bool     `json:"success"`
+	}
+
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/chat.sendMessage", nil, req, &resp, true)
+	if err != nil {
+		c.cache.unmarkSent(sentKey)
+
+		return "", err
+	}
+
+	if resp.Message != nil {
+		c.cache.cacheMessage(resp.Message)
+
+		if resp.Message.ID != "" {
+			return resp.Message.ID, nil
+		}
+	}
+
+	return msgID, nil
+}
+
+// UpdateMessage edits an existing message in roomID.
+func (c *Client) UpdateMessage(ctx context.Context, roomID, msgID, text string) error {
+	if roomID == "" || msgID == "" {
+		return errors.New("rocketchatclient: roomID and msgID are required")
+	}
+
+	editKey := "edit:" + msgID + "\x00" + text
+	c.cache.markSent(editKey)
+
+	req := struct {
+		RoomID string `json:"roomId"`
+		MsgID  string `json:"msgId"`
+		Text   string `json:"text"`
+	}{
+		RoomID: roomID,
+		MsgID:  msgID,
+		Text:   text,
+	}
+
+	var resp struct {
+		Message *Message `json:"message"`
+		Success bool     `json:"success"`
+	}
+
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/chat.update", nil, req, &resp, true)
+	if err != nil {
+		c.cache.unmarkSent(editKey)
+
+		return err
+	}
+
+	if resp.Message != nil {
+		c.cache.cacheMessage(resp.Message)
+	}
+
+	return nil
+}
+
+// DeleteMessage deletes a message in roomID.
+func (c *Client) DeleteMessage(ctx context.Context, roomID, msgID string) error {
+	if roomID == "" || msgID == "" {
+		return errors.New("rocketchatclient: roomID and msgID are required")
+	}
+
+	delKey := "del:" + msgID
+	c.cache.markSent(delKey)
+
+	req := struct {
+		RoomID string `json:"roomId"`
+		MsgID  string `json:"msgId"`
+	}{
+		RoomID: roomID,
+		MsgID:  msgID,
+	}
+
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/chat.delete", nil, req, nil, true)
+	if err != nil {
+		c.cache.unmarkSent(delKey)
+
+		return err
+	}
+
+	c.cache.forgetMessage(msgID)
+
+	return nil
+}
+
+// React adds or removes an emoji reaction on msgID.
+func (c *Client) React(ctx context.Context, msgID, emoji string, shouldReact bool) error {
+	if msgID == "" || emoji == "" {
+		return errors.New("rocketchatclient: msgID and emoji are required")
+	}
+
+	normalized := strings.Trim(emoji, ":")
+	if normalized == "" {
+		return errors.New("rocketchatclient: emoji is required")
+	}
+
+	req := struct {
+		MessageID   string `json:"messageId"`
+		Emoji       string `json:"emoji"`
+		ShouldReact bool   `json:"shouldReact"`
+	}{
+		MessageID:   msgID,
+		Emoji:       ":" + normalized + ":",
+		ShouldReact: shouldReact,
+	}
+
+	return c.doJSON(ctx, http.MethodPost, "/api/v1/chat.react", nil, req, nil, true)
+}
+
+// GetMessage fetches a single message by ID and updates the message cache.
+func (c *Client) GetMessage(ctx context.Context, msgID string) (*Message, error) {
+	if msgID == "" {
+		return nil, errors.New("rocketchatclient: msgID is required")
+	}
+
+	query := url.Values{}
+	query.Set("msgId", msgID)
+
+	var resp struct {
+		Message *Message `json:"message"`
+		Success bool     `json:"success"`
+	}
+
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/chat.getMessage", query, nil, &resp, true)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Message == nil {
+		return nil, errors.New("rocketchatclient: chat.getMessage response missing message")
+	}
+
+	c.cache.cacheMessage(resp.Message)
+
+	return resp.Message, nil
 }
 
 func (c *Client) doJSON(ctx context.Context, method, endpoint string, query url.Values, reqBody, out any, authenticated bool) error {
